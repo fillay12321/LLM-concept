@@ -108,19 +108,27 @@ class MinkowskiCoords:
 def _coords_from_embedding(
     emb: torch.Tensor,
     seq_len: int,
+    spatial_proj: nn.Linear,
+    time_scale: torch.Tensor,
 ) -> MinkowskiCoords:
-    """Derive deterministic 4D coordinates (t,x,y,z) from (S, N, E) embedding."""
+    """Derive 4D coordinates (t,x,y,z) from (S, N, E) embedding.
+
+    - t is derived from position index and scaled by a learnable scalar.
+    - (x,y,z) are derived from a learned linear projection of the embedding,
+      then bounded with tanh to [-1, 1].
+    """
     # Time coordinate from position index.
     # Use float32 for stable interval computation even if emb is fp16/bf16.
     device = emb.device
-    t = torch.arange(seq_len, device=device, dtype=torch.float32) / float(seq_len)
+    t0 = torch.arange(seq_len, device=device, dtype=torch.float32) / float(seq_len)
+    t = t0 * time_scale.to(dtype=torch.float32)
 
-    # Space coordinates from normalized embedding.
+    # Spatial coordinates from learned projection.
     # emb: (S, N, E) -> (N, S, E)
-    emb_n = emb.permute(1, 0, 2).to(dtype=torch.float32)
-    emb_n = F.normalize(emb_n, p=2, dim=-1, eps=1e-12)
-    cx, cy, cz = _chunk_means(emb_n)
-    return MinkowskiCoords(t=t, x=cx, y=cy, z=cz)
+    emb_f = emb.permute(1, 0, 2).to(dtype=torch.float32)
+    xyz = spatial_proj(emb_f)  # (N, S, 3)
+    xyz = torch.tanh(xyz)
+    return MinkowskiCoords(t=t, x=xyz[..., 0], y=xyz[..., 1], z=xyz[..., 2])
 
 
 class MinkowskiAttention(nn.Module):
@@ -174,6 +182,15 @@ class MinkowskiAttention(nn.Module):
         self.v_proj = nn.Linear(self.vdim, embed_dim, bias=bias, **factory_kwargs)
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias, **factory_kwargs)
 
+        # Learned map from embedding -> bounded 3D spatial coordinates.
+        self.spatial_proj = nn.Linear(embed_dim, 3, bias=True, **factory_kwargs)
+
+        nn.init.normal_(self.spatial_proj.weight, mean=0.0, std=0.02)
+        nn.init.zeros_(self.spatial_proj.bias)
+
+        # Learnable scale for time coordinate (controls effective light cone radius).
+        self.time_scale = nn.Parameter(torch.tensor(2.0, **factory_kwargs))
+
         # Learnable metric scalars
         self.alpha = nn.Parameter(torch.tensor(1.0, **factory_kwargs))
         self.beta = nn.Parameter(torch.tensor(1.0, **factory_kwargs))
@@ -221,8 +238,16 @@ class MinkowskiAttention(nn.Module):
         vh = _split_heads(v_proj, self.num_heads)  # (N, H, S, D)
 
         # Coordinates derived from position and (key) embedding, deterministically.
-        q_coords = _coords_from_embedding(q, tgt_len)
-        k_coords = _coords_from_embedding(k, src_len)
+        # If kdim != embed_dim, derive coords from the projected representations.
+        q_for_coords = q if q.shape[-1] == self.embed_dim else q_proj
+        k_for_coords = k if k.shape[-1] == self.embed_dim else k_proj
+
+        q_coords = _coords_from_embedding(
+            q_for_coords, tgt_len, spatial_proj=self.spatial_proj, time_scale=self.time_scale
+        )
+        k_coords = _coords_from_embedding(
+            k_for_coords, src_len, spatial_proj=self.spatial_proj, time_scale=self.time_scale
+        )
 
         # Build Minkowski interval logits: (N, L, S)
         # dt depends only on positions (shared across batch)
