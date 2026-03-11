@@ -227,10 +227,15 @@ def train_language_model(
     epoch_losses: list[float] = []
     epoch_stats: list[TrainStats] = []
 
-    for _ in range(epochs):
+    num_batches = (train_seqs.shape[0] + batch_size - 1) // batch_size
+
+    for epoch_idx in range(epochs):
+        print(f"Epoch {epoch_idx + 1}/{epochs} starting...")
         t0 = time.perf_counter()
         losses = []
-        for batch in _iterate_minibatches(train_seqs, batch_size, shuffle=True):
+        for batch_idx, batch in enumerate(
+            _iterate_minibatches(train_seqs, batch_size, shuffle=True), start=1
+        ):
             # Next-token prediction
             inp = batch[:, :-1]
             tgt = batch[:, 1:]
@@ -244,10 +249,17 @@ def train_language_model(
 
             losses.append(loss.item())
 
+            if batch_idx % 50 == 0 or batch_idx == num_batches:
+                print(f"  Batch {batch_idx}/{num_batches} | loss={loss.item():.4f}")
+
         t1 = time.perf_counter()
         mean_loss = float(sum(losses) / max(len(losses), 1))
         epoch_losses.append(mean_loss)
         epoch_stats.append(TrainStats(mean_loss=mean_loss, wall_time_s=t1 - t0))
+
+        print(
+            f"Epoch {epoch_idx + 1}/{epochs} done | mean_loss={mean_loss:.4f} | time={t1 - t0:.1f}s"
+        )
 
     return epoch_losses, epoch_stats
 
@@ -308,6 +320,11 @@ def main():
         num_layers=num_layers,
         dropout=dropout,
     ).to(device)
+
+    mink_params = sum(p.numel() for p in mink.parameters())
+    std_params = sum(p.numel() for p in std.parameters())
+    print(f"Minkowski params: {mink_params:,}")
+    print(f"Standard params: {std_params:,}")
 
     mink_losses, _ = train_language_model(mink, train_seqs, epochs, batch_size, lr)
     std_losses, _ = train_language_model(std, train_seqs, epochs, batch_size, lr)
