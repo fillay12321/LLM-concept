@@ -1,15 +1,61 @@
-import time
-from typing import List
+from typing import List, Tuple
 
 import torch
 from torch import nn
 from torch.nn import functional as F
 
 
-def _entropy_from_logits(logits: torch.Tensor) -> torch.Tensor:
-    # logits: (K,)
-    p = F.softmax(logits.to(dtype=torch.float32), dim=-1).clamp_min(1e-12)
+def _entropy_from_probs(p: torch.Tensor) -> torch.Tensor:
+    p = p.to(dtype=torch.float32).clamp_min(1e-12)
     return -(p * p.log()).sum()
+
+
+def _iterative_collapse(
+    *,
+    base_logits: torch.Tensor,
+    candidate_states: torch.Tensor,
+    context_vec: torch.Tensor,
+    T: int,
+    lambda_interference: float,
+    gamma_context: float,
+    mu_diversity: float,
+    convergence_eps: float = 1e-4,
+) -> Tuple[torch.Tensor, int]:
+    # base_logits: (K,)
+    # candidate_states: (K, D) normalized
+    # context_vec: (D,) normalized
+
+    K = base_logits.shape[0]
+
+    # C(k) = cos(candidate, context)
+    C = torch.matmul(candidate_states, context_vec)  # (K,)
+
+    # I(i,j) = cos(candidate_i, candidate_j)
+    I = candidate_states @ candidate_states.t()  # (K, K)
+    I.fill_diagonal_(0.0)
+
+    # Initial amplitudes from logits restricted to top-K
+    A = F.softmax(base_logits.to(dtype=torch.float32), dim=-1)  # (K,)
+
+    iters_to_conv = 0
+    for t in range(int(T)):
+        prev = A
+
+        A = A + float(lambda_interference) * (I @ A)
+        A = A + float(gamma_context) * C
+
+        # Diversity penalty uses each candidate's max similarity to others
+        max_sim = I.max(dim=1).values  # (K,)
+        A = A - float(mu_diversity) * max_sim * A
+
+        A = F.softmax(A, dim=-1)
+
+        max_change = (A - prev).abs().max().item()
+        iters_to_conv = t + 1
+        if max_change < convergence_eps:
+            break
+
+    return A, iters_to_conv
 
 
 class GreedyDecoder:
@@ -35,10 +81,21 @@ class GreedyDecoder:
 
 
 class WaveCollapseDecoder:
-    def __init__(self, model: nn.Module, K: int = 5, lambda_interference: float = 0.3) -> None:
+    def __init__(
+        self,
+        model: nn.Module,
+        K: int = 10,
+        T: int = 5,
+        lambda_interference: float = 0.3,
+        gamma_context: float = 0.2,
+        mu_diversity: float = 0.1,
+    ) -> None:
         self.model = model
         self.K = int(K)
+        self.T = int(T)
         self.lambda_interference = float(lambda_interference)
+        self.gamma_context = float(gamma_context)
+        self.mu_diversity = float(mu_diversity)
 
         if self.K <= 0:
             raise ValueError("K must be positive")
@@ -55,58 +112,87 @@ class WaveCollapseDecoder:
         if not hasattr(self.model, "tok_emb"):
             raise AttributeError("model must have tok_emb for WaveCollapseDecoder")
 
+        if not hasattr(self.model, "get_hidden_states"):
+            raise AttributeError("model must implement get_hidden_states(tokens) for WaveCollapseDecoder")
+
         for _ in range(max_new_tokens):
             logits = self.model(tokens)  # (1, L, V)
             next_logits = logits[0, -1]  # (V,)
 
-            probs = F.softmax(next_logits.to(dtype=torch.float32), dim=-1)
-            top_p, top_idx = torch.topk(probs, k=min(self.K, probs.numel()), dim=-1)
+            hidden_states = self.model.get_hidden_states(tokens)  # (1, L, D)
 
-            # Amplitudes A(k)
-            A = top_p  # (K,)
+            # Top-K candidates by logit value
+            top_logits, top_idx = torch.topk(next_logits, k=min(self.K, next_logits.numel()), dim=-1)
 
-            # Embeddings for interference
-            emb = self.model.tok_emb(top_idx)  # (K, D)
-            emb = F.normalize(emb.to(dtype=torch.float32), p=2, dim=-1, eps=1e-12)
+            # Candidate states from token embedding table
+            candidate_states = self.model.tok_emb(top_idx)  # (K, D)
+            candidate_states = F.normalize(candidate_states.to(dtype=torch.float32), p=2, dim=-1, eps=1e-12)
 
-            # Pairwise cosine similarity matrix: (K, K)
-            I = emb @ emb.t()
-            I.fill_diagonal_(0.0)
+            # Context vector from last 3 hidden states
+            ctx = hidden_states[0, max(hidden_states.shape[1] - 3, 0) :, :].mean(dim=0)
+            context_vec = F.normalize(ctx.to(dtype=torch.float32), p=2, dim=-1, eps=1e-12)
 
-            # Wave weight W(k) = A(k) + lambda * sum_j I(k,j)*A(j)
-            W = A + self.lambda_interference * (I @ A)
+            A, _ = _iterative_collapse(
+                base_logits=top_logits,
+                candidate_states=candidate_states,
+                context_vec=context_vec,
+                T=self.T,
+                lambda_interference=self.lambda_interference,
+                gamma_context=self.gamma_context,
+                mu_diversity=self.mu_diversity,
+            )
 
-            next_id = int(top_idx[W.argmax(dim=-1)].item())
+            next_id = int(top_idx[A.argmax(dim=-1)].item())
             tokens = torch.cat([tokens, torch.tensor([[next_id]], device=device, dtype=tokens.dtype)], dim=1)
 
         return tokens[0].tolist()
 
 
 @torch.no_grad()
-def wave_collapse_step_stats(model: nn.Module, tokens: torch.Tensor, K: int, lambda_interference: float):
+def wave_collapse_step_stats(
+    model: nn.Module,
+    tokens: torch.Tensor,
+    *,
+    K: int,
+    T: int,
+    lambda_interference: float,
+    gamma_context: float,
+    mu_diversity: float,
+    convergence_eps: float = 1e-4,
+):
     """Compute next-token selection stats for WaveCollapse decoding.
 
     Returns:
         next_id: int
-        entropy_W: float  (entropy of softmax(W))
+        final_A: (K,) float tensor (softmax-normalized after iterative collapse)
+        iters_to_conv: int
         top_ids: (K,) LongTensor
     """
     logits = model(tokens)  # (1, L, V)
     next_logits = logits[0, -1]  # (V,)
 
-    probs = F.softmax(next_logits.to(dtype=torch.float32), dim=-1)
-    top_p, top_idx = torch.topk(probs, k=min(K, probs.numel()), dim=-1)
+    if not hasattr(model, "get_hidden_states"):
+        raise AttributeError("model must implement get_hidden_states(tokens) for WaveCollapse decoding")
+    hidden_states = model.get_hidden_states(tokens)  # (1, L, D)
 
-    A = top_p  # (K,)
-    emb = model.tok_emb(top_idx)  # (K, D)
-    emb = F.normalize(emb.to(dtype=torch.float32), p=2, dim=-1, eps=1e-12)
+    top_logits, top_idx = torch.topk(next_logits, k=min(int(K), next_logits.numel()), dim=-1)
 
-    I = emb @ emb.t()
-    I.fill_diagonal_(0.0)
+    candidate_states = model.tok_emb(top_idx)
+    candidate_states = F.normalize(candidate_states.to(dtype=torch.float32), p=2, dim=-1, eps=1e-12)
 
-    W = A + lambda_interference * (I @ A)
+    ctx = hidden_states[0, max(hidden_states.shape[1] - 3, 0) :, :].mean(dim=0)
+    context_vec = F.normalize(ctx.to(dtype=torch.float32), p=2, dim=-1, eps=1e-12)
 
-    entropy_W = float(_entropy_from_logits(W).item())
-    next_id = int(top_idx[W.argmax(dim=-1)].item())
+    final_A, iters_to_conv = _iterative_collapse(
+        base_logits=top_logits,
+        candidate_states=candidate_states,
+        context_vec=context_vec,
+        T=int(T),
+        lambda_interference=float(lambda_interference),
+        gamma_context=float(gamma_context),
+        mu_diversity=float(mu_diversity),
+        convergence_eps=float(convergence_eps),
+    )
 
-    return next_id, entropy_W, top_idx
+    next_id = int(top_idx[final_A.argmax(dim=-1)].item())
+    return next_id, final_A, iters_to_conv, top_idx

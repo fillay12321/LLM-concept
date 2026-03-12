@@ -29,6 +29,22 @@ class MinkowskiTransformer(nn.Module):
         self.ln_f = nn.LayerNorm(d_model)
         self.head = nn.Linear(d_model, vocab_size, bias=False)
 
+    def get_hidden_states(self, tokens: torch.Tensor) -> torch.Tensor:
+        bsz, seq_len = tokens.shape
+        if seq_len > self.max_seq_len:
+            raise ValueError(f"seq_len={seq_len} exceeds max_seq_len={self.max_seq_len}")
+
+        device = tokens.device
+        pos = torch.arange(seq_len, device=device)
+
+        x = self.tok_emb(tokens) + self.pos_emb(pos)[None, :, :]
+        x = self.drop(x)
+
+        for blk in self.blocks:
+            x = blk(x)
+
+        return x
+
     def forward(self, tokens: torch.Tensor) -> torch.Tensor:
         bsz, seq_len = tokens.shape
         if seq_len > self.max_seq_len:
