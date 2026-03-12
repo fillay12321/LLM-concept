@@ -1,3 +1,3 @@
-# Placeholder for Wave Collapse Decoder
+from .wave_collapse import GreedyDecoder, WaveCollapseDecoder
 
-__all__ = []
+__all__ = ["WaveCollapseDecoder", "GreedyDecoder"]
