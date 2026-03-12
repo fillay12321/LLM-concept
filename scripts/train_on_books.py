@@ -159,7 +159,11 @@ def _generation_sample(
         mu_diversity=0.0,
     )
 
+<<<<<<< HEAD
     seed = torch.tensor([prompt_ids], dtype=torch.long, device=device)
+=======
+    seed = torch.tensor([prompt_ids], dtype=torch.long).to(device)
+>>>>>>> 4a425ae (compare with GPT-2)
     g_ids = greedy.generate(seed, max_new_tokens=50)
     w_ids = wave.generate(seed, max_new_tokens=50)
 
@@ -222,7 +226,17 @@ def _train_epoch(
             print()
             model.eval()
             with torch.no_grad():
+<<<<<<< HEAD
                 _generation_sample(model=model, tokenizer=tokenizer, batch=batch, batch_idx=global_batch, device=device)
+=======
+                _generation_sample(
+                    model=model,
+                    tokenizer=tokenizer,
+                    batch=batch,
+                    batch_idx=global_batch,
+                    device=next(model.parameters()).device,
+                )
+>>>>>>> 4a425ae (compare with GPT-2)
             model.train()
             epoch_start = time.perf_counter()
 
