@@ -225,6 +225,8 @@ def _train_epoch(
     base_lr: float,
     min_lr: float,
     warmup_steps: int,
+    accumulation_steps: int,
+    scaler,
     device: torch.device,
 ) -> Tuple[float, float, List[float], int, int]:
     model.train()
@@ -237,28 +239,52 @@ def _train_epoch(
     global_batch = global_batch_offset
     global_step = global_step_offset
 
+    opt.zero_grad(set_to_none=True)
+
     for step, batch in enumerate(train_loader, start=1):
         batch = batch.to(device=device, dtype=torch.long)
         inp = batch[:, :-1]
         tgt = batch[:, 1:]
 
-        global_step += 1
-        lr = _lr_for_step(
-            global_step=global_step,
-            total_steps=total_steps,
-            base_lr=base_lr,
-            min_lr=min_lr,
-            warmup_steps=warmup_steps,
-        )
-        _set_optimizer_lr(opt, lr)
+        if scaler is not None and device.type == "cuda":
+            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                logits = model(inp)
+                loss = _lm_loss(logits, tgt)
+        else:
+            logits = model(inp)
+            loss = _lm_loss(logits, tgt)
 
-        logits = model(inp)
-        loss = _lm_loss(logits, tgt)
+        loss = loss / float(accumulation_steps)
 
-        opt.zero_grad(set_to_none=True)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        opt.step()
+        if scaler is not None and device.type == "cuda":
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
+
+        perform_step = (step % accumulation_steps == 0) or (step == num_batches)
+
+        if perform_step:
+            next_step = global_step + 1
+            lr = _lr_for_step(
+                global_step=next_step,
+                total_steps=total_steps,
+                base_lr=base_lr,
+                min_lr=min_lr,
+                warmup_steps=warmup_steps,
+            )
+            _set_optimizer_lr(opt, lr)
+
+            if scaler is not None and device.type == "cuda":
+                scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(opt)
+                scaler.update()
+            else:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                opt.step()
+
+            opt.zero_grad(set_to_none=True)
+            global_step = next_step
 
         losses.append(float(loss.item()))
 
@@ -300,6 +326,9 @@ def main() -> None:
     args = parser.parse_args()
 
     torch.manual_seed(42)
+
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -319,7 +348,7 @@ def main() -> None:
     print(f"  Val sequences: {len(val_ds):,}", flush=True)
     print(f"  Vocab size: {tok.vocab_size:,}", flush=True)
 
-    batch_size = 8
+    batch_size = 24
     train_loader = DataLoader(
         train_ds,
         batch_size=batch_size,
@@ -327,6 +356,8 @@ def main() -> None:
         drop_last=True,
         num_workers=4,
         pin_memory=True,
+        prefetch_factor=2,
+        persistent_workers=True,
     )
     val_loader = DataLoader(
         val_ds,
@@ -335,6 +366,8 @@ def main() -> None:
         drop_last=False,
         num_workers=4,
         pin_memory=True,
+        prefetch_factor=2,
+        persistent_workers=True,
     )
 
     cfg = {
@@ -347,15 +380,22 @@ def main() -> None:
     }
 
     model = MinkowskiTransformer(**cfg).to(device)
+    compile_enabled = hasattr(torch, "compile")
+    if compile_enabled:
+        model = torch.compile(model)
+
     print(f"Minkowski params: {sum(p.numel() for p in model.parameters()):,}", flush=True)
 
     base_lr = 3e-4
     min_lr = 1e-5
     epochs = 10
+    accumulation_steps = 4
     warmup_steps = 500
 
     os.makedirs("checkpoints", exist_ok=True)
     opt = torch.optim.AdamW(model.parameters(), lr=base_lr)
+
+    scaler = torch.cuda.amp.GradScaler() if device.type == "cuda" else None
 
     best_loss = float("inf")
     best_ppl = float("inf")
@@ -366,7 +406,21 @@ def main() -> None:
     global_batches = 0
     global_step = 0
 
-    total_steps = epochs * len(train_loader)
+    total_steps_per_epoch = max((len(train_loader) + accumulation_steps - 1) // accumulation_steps, 1)
+    total_steps = epochs * total_steps_per_epoch
+
+    effective_batch = batch_size * accumulation_steps
+    fp16_enabled = device.type == "cuda"
+    est_time_min = (len(train_loader) * 0.05) / 60.0
+    print(
+        f"batch_size={batch_size} | accum_steps={accumulation_steps} | effective_batch={effective_batch}",
+        flush=True,
+    )
+    print(
+        f"fp16={fp16_enabled} | compile={compile_enabled} | seq_len={seq_len}",
+        flush=True,
+    )
+    print(f"estimated time per epoch: {est_time_min:.1f} min", flush=True)
 
     for epoch in range(1, epochs + 1):
         print(f"\nTraining epoch {epoch}/{epochs}...", flush=True)
@@ -384,6 +438,8 @@ def main() -> None:
             base_lr=base_lr,
             min_lr=min_lr,
             warmup_steps=warmup_steps,
+            accumulation_steps=accumulation_steps,
+            scaler=scaler,
             device=device,
         )
         loss_history.extend(epoch_losses)
