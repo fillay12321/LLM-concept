@@ -382,7 +382,7 @@ def main() -> None:
     model = MinkowskiTransformer(**cfg).to(device)
     compile_enabled = hasattr(torch, "compile")
     if compile_enabled:
-        model = torch.compile(model)
+       #model = torch.compile(model)
 
     print(f"Minkowski params: {sum(p.numel() for p in model.parameters()):,}", flush=True)
 
