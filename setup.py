@@ -5,5 +5,5 @@ setup(
     version="0.0.0",
     description="TRIAD-LLM-concept: Minkowski spacetime attention",
     packages=find_packages(),
-    install_requires=["torch"],
+    install_requires=["torch", "tiktoken"],
 )
