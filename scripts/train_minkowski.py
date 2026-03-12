@@ -320,8 +320,22 @@ def main() -> None:
     print(f"  Vocab size: {tok.vocab_size:,}", flush=True)
 
     batch_size = 8
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=True)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, drop_last=False)
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=batch_size,
+        shuffle=True,
+        drop_last=True,
+        num_workers=4,
+        pin_memory=True,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        drop_last=False,
+        num_workers=4,
+        pin_memory=True,
+    )
 
     cfg = {
         "vocab_size": tok.vocab_size,
