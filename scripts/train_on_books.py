@@ -47,7 +47,6 @@ def _ascii_loss_curve(losses: List[float], *, title: str) -> None:
 
     levels = []
     for v in samples:
-        # Map to [0, height-1]
         levels.append(int(round((v - lo) / rng * (height - 1))))
 
     print(f"Loss curve ({title}):")
@@ -77,11 +76,11 @@ def _format_wall(seconds: float) -> str:
 
 
 @torch.no_grad()
-def _eval_perplexity(model: nn.Module, loader: DataLoader) -> float:
+def _eval_perplexity(model: nn.Module, loader: DataLoader, device: torch.device) -> float:
     model.eval()
     losses = []
     for batch in loader:
-        batch = batch.to(torch.long)
+        batch = batch.to(device=device, dtype=torch.long)
         inp = batch[:, :-1]
         tgt = batch[:, 1:]
         logits = model(inp)
@@ -93,8 +92,7 @@ def _eval_perplexity(model: nn.Module, loader: DataLoader) -> float:
 
 
 @torch.no_grad()
-def _mean_sequence_coherence(model: nn.Module, loader: DataLoader, tok: TiktokenWrapper, *, n_prompts: int = 32) -> Tuple[float, float]:
-    # Compare Greedy vs Wave coherence on prompts drawn from val set.
+def _mean_sequence_coherence(model: nn.Module, loader: DataLoader, tok: TiktokenWrapper, device: torch.device, *, n_prompts: int = 32) -> Tuple[float, float]:
     greedy = GreedyDecoder(model)
     wave = WaveCollapseDecoder(
         model,
@@ -107,13 +105,13 @@ def _mean_sequence_coherence(model: nn.Module, loader: DataLoader, tok: Tiktoken
     )
 
     def pairwise_cos_sim(ids: List[int]) -> float:
-        x = model.tok_emb(torch.tensor(ids, dtype=torch.long))
+        x = model.tok_emb(torch.tensor(ids, dtype=torch.long, device=device))
         x = F.normalize(x.to(dtype=torch.float32), p=2, dim=-1, eps=1e-12)
         sim = x @ x.t()
         n = sim.shape[0]
         if n <= 1:
             return 1.0
-        mask = ~torch.eye(n, dtype=torch.bool)
+        mask = ~torch.eye(n, dtype=torch.bool, device=device)
         return float(sim[mask].mean().item())
 
     g_scores = []
@@ -123,7 +121,7 @@ def _mean_sequence_coherence(model: nn.Module, loader: DataLoader, tok: Tiktoken
     for batch in loader:
         if seen >= n_prompts:
             break
-        batch = batch.to(torch.long)
+        batch = batch.to(device=device, dtype=torch.long)
         for i in range(batch.shape[0]):
             if seen >= n_prompts:
                 break
@@ -145,6 +143,7 @@ def _generation_sample(
     tokenizer: TiktokenWrapper,
     batch: torch.Tensor,
     batch_idx: int,
+    device: torch.device,
 ) -> None:
     prompt_ids = batch[0, :20].tolist()
     prompt_txt = tokenizer.decode(prompt_ids)
@@ -160,7 +159,7 @@ def _generation_sample(
         mu_diversity=0.0,
     )
 
-    seed = torch.tensor([prompt_ids], dtype=torch.long)
+    seed = torch.tensor([prompt_ids], dtype=torch.long, device=device)
     g_ids = greedy.generate(seed, max_new_tokens=50)
     w_ids = wave.generate(seed, max_new_tokens=50)
 
@@ -185,6 +184,7 @@ def _train_epoch(
     epochs: int,
     tokenizer: TiktokenWrapper,
     global_batch_offset: int,
+    device: torch.device,
 ) -> Tuple[float, float, List[float], int]:
     model.train()
     t0 = time.perf_counter()
@@ -194,7 +194,7 @@ def _train_epoch(
     epoch_start = time.perf_counter()
 
     for step, batch in enumerate(train_loader, start=1):
-        batch = batch.to(torch.long)
+        batch = batch.to(device=device, dtype=torch.long)
         inp = batch[:, :-1]
         tgt = batch[:, 1:]
 
@@ -222,7 +222,7 @@ def _train_epoch(
             print()
             model.eval()
             with torch.no_grad():
-                _generation_sample(model=model, tokenizer=tokenizer, batch=batch, batch_idx=global_batch)
+                _generation_sample(model=model, tokenizer=tokenizer, batch=batch, batch_idx=global_batch, device=device)
             model.train()
             epoch_start = time.perf_counter()
 
@@ -239,8 +239,10 @@ def main():
     args = parser.parse_args()
 
     torch.manual_seed(42)
+    torch.backends.cudnn.benchmark = True
 
-    device = torch.device("cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
 
     seq_len = 256
     stride = 128
@@ -307,6 +309,7 @@ def main():
             epochs=epochs,
             tokenizer=tok,
             global_batch_offset=mink_global_batches,
+            device=device,
         )
         mink_loss_history.extend(mink_epoch_losses)
         mink_best_loss = min(mink_best_loss, mink_mean_loss)
@@ -320,12 +323,13 @@ def main():
             epochs=epochs,
             tokenizer=tok,
             global_batch_offset=std_global_batches,
+            device=device,
         )
         std_loss_history.extend(std_epoch_losses)
         std_best_loss = min(std_best_loss, std_mean_loss)
 
-        mink_ppl = _eval_perplexity(mink, val_loader)
-        std_ppl = _eval_perplexity(std, val_loader)
+        mink_ppl = _eval_perplexity(mink, val_loader, device=device)
+        std_ppl = _eval_perplexity(std, val_loader, device=device)
 
         if mink_ppl < mink_best_ppl:
             mink_best_ppl = mink_ppl
@@ -377,7 +381,7 @@ def main():
     print(f"Best Minkowski perplexity: {mink_best_ppl:.2f} (epoch {mink_best_epoch})")
     print(f"Best Standard perplexity: {std_best_ppl:.2f} (epoch {std_best_epoch})")
 
-    g_coh, w_coh = _mean_sequence_coherence(mink, val_loader, tok)
+    g_coh, w_coh = _mean_sequence_coherence(mink, val_loader, tok, device=device)
     print(f"Wave vs Greedy coherence on val set: {w_coh:.3f} vs {g_coh:.3f}")
 
     winner = "Minkowski" if mink_best_ppl < std_best_ppl else "Standard"
