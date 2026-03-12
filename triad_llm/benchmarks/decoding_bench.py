@@ -38,6 +38,7 @@ def _decode_stats(decoder_name: str, decoder, model: MinkowskiTransformer, seeds
     examples = []
     wave_iters = []
     wave_a_entropy = []
+    wave_diversity = []
 
     device = torch.device("cpu")
     _ = device
@@ -52,6 +53,7 @@ def _decode_stats(decoder_name: str, decoder, model: MinkowskiTransformer, seeds
             step_H = []
             step_iters = []
             step_a_ent = []
+            step_a_std = []
             for _ in range(max_new_tokens):
                 next_id, final_A, iters_to_conv, _ = wave_collapse_step_stats(
                     model,
@@ -59,17 +61,20 @@ def _decode_stats(decoder_name: str, decoder, model: MinkowskiTransformer, seeds
                     K=K,
                     T=5,
                     lambda_interference=lam,
+                    tau=0.5,
                     gamma_context=0.2,
                     mu_diversity=0.1,
                 )
                 step_H.append(float((-(final_A.clamp_min(1e-12) * final_A.clamp_min(1e-12).log()).sum()).item()))
                 step_iters.append(int(iters_to_conv))
                 step_a_ent.append(float((-(final_A.clamp_min(1e-12) * final_A.clamp_min(1e-12).log()).sum()).item()))
+                step_a_std.append(float(final_A.to(dtype=torch.float32).std(unbiased=False).item()))
                 tokens = torch.cat([tokens, torch.tensor([[next_id]], dtype=tokens.dtype)], dim=1)
             seq = tokens[0].tolist()
             entropies.append(float(sum(step_H) / max(len(step_H), 1)))
             wave_iters.append(float(sum(step_iters) / max(len(step_iters), 1)))
             wave_a_entropy.append(float(sum(step_a_ent) / max(len(step_a_ent), 1)))
+            wave_diversity.append(float(sum(step_a_std) / max(len(step_a_std), 1)))
         else:
             seq = decoder.generate(seed, max_new_tokens=max_new_tokens)
             # For greedy, compute entropy of the model distribution at each step for comparability.
@@ -100,6 +105,7 @@ def _decode_stats(decoder_name: str, decoder, model: MinkowskiTransformer, seeds
         "examples": examples,
         "mean_wave_iters": float(sum(wave_iters) / len(wave_iters)) if len(wave_iters) > 0 else 0.0,
         "mean_wave_a_entropy": float(sum(wave_a_entropy) / len(wave_a_entropy)) if len(wave_a_entropy) > 0 else 0.0,
+        "mean_wave_diversity": float(sum(wave_diversity) / len(wave_diversity)) if len(wave_diversity) > 0 else 0.0,
     }
 
 
@@ -134,18 +140,18 @@ def main():
     seeds = torch.randint(0, vocab_size, (num_seqs, seed_len), device=device)
 
     greedy = GreedyDecoder(model)
-    wave = WaveCollapseDecoder(model, K=K, T=5, lambda_interference=lam, gamma_context=0.2, mu_diversity=0.1)
+    wave = WaveCollapseDecoder(model, K=K, T=5, lambda_interference=lam, tau=0.5, gamma_context=0.2, mu_diversity=0.1)
 
     res_g = _decode_stats("greedy", greedy, model, seeds, max_new_tokens=max_new_tokens, K=K, lam=lam)
     res_w = _decode_stats("wave", wave, model, seeds, max_new_tokens=max_new_tokens, K=K, lam=lam)
 
-    print("Decoder | mean_entropy | mean_cos_sim | time_per_seq(ms) | wave_iters | A_entropy")
+    print("Decoder | mean_entropy | mean_cos_sim | time_per_seq(ms) | wave_iters | A_entropy | wave_collapse_diversity")
     print("-" * 86)
     print(
-        f"Greedy  | {res_g['mean_entropy']:.4f}      | {res_g['mean_coherence']:.4f}      | {res_g['time_per_seq_s']*1000.0:.2f}          | {0.0:.2f}     | {0.0:.4f}"
+        f"Greedy  | {res_g['mean_entropy']:.4f}      | {res_g['mean_coherence']:.4f}      | {res_g['time_per_seq_s']*1000.0:.2f}          | {0.0:.2f}     | {0.0:.4f}   | {0.0:.4f}"
     )
     print(
-        f"Wave    | {res_w['mean_entropy']:.4f}      | {res_w['mean_coherence']:.4f}      | {res_w['time_per_seq_s']*1000.0:.2f}          | {res_w['mean_wave_iters']:.2f}     | {res_w['mean_wave_a_entropy']:.4f}"
+        f"Wave    | {res_w['mean_entropy']:.4f}      | {res_w['mean_coherence']:.4f}      | {res_w['time_per_seq_s']*1000.0:.2f}          | {res_w['mean_wave_iters']:.2f}     | {res_w['mean_wave_a_entropy']:.4f}   | {res_w['mean_wave_diversity']:.4f}"
     )
 
     print("\nExamples (Greedy vs Wave):")

@@ -17,6 +17,7 @@ def _iterative_collapse(
     context_vec: torch.Tensor,
     T: int,
     lambda_interference: float,
+    tau: float = 0.5,
     gamma_context: float,
     mu_diversity: float,
     convergence_eps: float = 1e-4,
@@ -30,8 +31,10 @@ def _iterative_collapse(
     # C(k) = cos(candidate, context)
     C = torch.matmul(candidate_states, context_vec)  # (K,)
 
-    # I(i,j) = cos(candidate_i, candidate_j)
-    I = candidate_states @ candidate_states.t()  # (K, K)
+    # Full interference: similar=constructive, dissimilar=destructive.
+    # Temperature scaling controls interference sharpness.
+    I = candidate_states @ candidate_states.t()  # (K, K), range [-1, 1]
+    I = I / float(tau)
     I.fill_diagonal_(0.0)
 
     # Initial amplitudes from logits restricted to top-K
@@ -41,12 +44,13 @@ def _iterative_collapse(
     for t in range(int(T)):
         prev = A
 
-        A = A + float(lambda_interference) * (I @ A)
-        A = A + float(gamma_context) * C
+        # Normalized interference prevents runaway amplification from positive feedback.
+        raw_interference = I @ A  # (K,)
+        norm = I.abs().sum(dim=1).clamp_min(1e-12)  # (K,)
+        interference = raw_interference / norm
 
-        # Diversity penalty uses each candidate's max similarity to others
-        max_sim = I.max(dim=1).values  # (K,)
-        A = A - float(mu_diversity) * max_sim * A
+        A = A + float(lambda_interference) * interference
+        A = A + float(gamma_context) * C
 
         A = F.softmax(A, dim=-1)
 
@@ -87,6 +91,7 @@ class WaveCollapseDecoder:
         K: int = 10,
         T: int = 5,
         lambda_interference: float = 0.3,
+        tau: float = 0.5,
         gamma_context: float = 0.2,
         mu_diversity: float = 0.1,
     ) -> None:
@@ -94,6 +99,7 @@ class WaveCollapseDecoder:
         self.K = int(K)
         self.T = int(T)
         self.lambda_interference = float(lambda_interference)
+        self.tau = float(tau)
         self.gamma_context = float(gamma_context)
         self.mu_diversity = float(mu_diversity)
 
@@ -138,6 +144,7 @@ class WaveCollapseDecoder:
                 context_vec=context_vec,
                 T=self.T,
                 lambda_interference=self.lambda_interference,
+                tau=self.tau,
                 gamma_context=self.gamma_context,
                 mu_diversity=self.mu_diversity,
             )
@@ -156,6 +163,7 @@ def wave_collapse_step_stats(
     K: int,
     T: int,
     lambda_interference: float,
+    tau: float = 0.5,
     gamma_context: float,
     mu_diversity: float,
     convergence_eps: float = 1e-4,
@@ -189,6 +197,7 @@ def wave_collapse_step_stats(
         context_vec=context_vec,
         T=int(T),
         lambda_interference=float(lambda_interference),
+        tau=float(tau),
         gamma_context=float(gamma_context),
         mu_diversity=float(mu_diversity),
         convergence_eps=float(convergence_eps),
