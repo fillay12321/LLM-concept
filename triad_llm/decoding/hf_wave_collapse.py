@@ -67,8 +67,8 @@ class HFWaveCollapseDecoder:
         self,
         model: nn.Module,
         tokenizer,
-        K: int = 16,
-        T: int = 16,
+        K: int = 8,
+        T: int = 3,
         lambda_interference: float = 0.1,
         gamma_context: float = 1.0,
         tau: float = 0.5,
@@ -164,11 +164,20 @@ class HFWaveCollapseDecoder:
 
         generated_ids: dict[int, int] = {}
 
+        past_key_values = None
+        current_input = input_ids
+
         # Autoregressive generation with wave collapse
         for _ in range(max_new_tokens):
-            outputs = self.model(input_ids=input_ids, output_hidden_states=True)
+            outputs = self.model(
+                input_ids=current_input,
+                past_key_values=past_key_values,
+                output_hidden_states=True,
+                use_cache=True,
+            )
             logits = outputs.logits  # (1, L, V)
             hidden_states = outputs.hidden_states[-1]  # (1, L, D)
+            past_key_values = outputs.past_key_values
 
             next_logits = logits[0, -1]  # (V,)
             next_id = self._iterative_collapse(next_logits, hidden_states, generated_ids)
@@ -176,6 +185,7 @@ class HFWaveCollapseDecoder:
             next_token = torch.tensor([[next_id]], device=self.device, dtype=input_ids.dtype)
             input_ids = torch.cat([input_ids, next_token], dim=1)
             generated_ids[next_id] = generated_ids.get(next_id, 0) + 1
+            current_input = next_token  # only feed new token each step
 
         # Return decoded string
         return self.tokenizer.decode(input_ids[0], skip_special_tokens=True)

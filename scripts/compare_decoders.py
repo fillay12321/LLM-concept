@@ -104,8 +104,8 @@ def _generate_wave(model, tokenizer, prompt: str, max_new_tokens: int) -> Tuple[
     decoder = HFWaveCollapseDecoder(
         model,
         tokenizer,
-        K=16,
-        T=16,
+        K=8,
+        T=3,
         lambda_interference=0.1,
         gamma_context=1.0,
         tau=0.5,
