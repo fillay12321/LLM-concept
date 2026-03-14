@@ -59,7 +59,7 @@ def _generate_greedy(model, tokenizer, prompt: str, max_new_tokens: int) -> Tupl
             input_ids=input_ids,
             max_new_tokens=max_new_tokens,
             do_sample=False,
-            repetition_penalty=1.3,
+            repetition_penalty=2.5,
             pad_token_id=tokenizer.eos_token_id,
         )
     dt_ms = int((time.perf_counter() - t0) * 1000)
@@ -84,7 +84,7 @@ def _generate_topk(model, tokenizer, prompt: str, max_new_tokens: int, k: int = 
             do_sample=True,
             top_k=k,
             top_p=1.0,
-            repetition_penalty=1.3,
+            repetition_penalty=2.5,
             pad_token_id=tokenizer.eos_token_id,
         )
     dt_ms = int((time.perf_counter() - t0) * 1000)
@@ -109,7 +109,7 @@ def _generate_wave(model, tokenizer, prompt: str, max_new_tokens: int) -> Tuple[
         lambda_interference=0.1,
         gamma_context=1.0,
         tau=0.5,
-        repetition_penalty=1.3,
+        repetition_penalty=2.5,
     )
 
     t0 = time.perf_counter()

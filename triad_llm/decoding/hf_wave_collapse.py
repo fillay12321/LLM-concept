@@ -72,7 +72,7 @@ class HFWaveCollapseDecoder:
         lambda_interference: float = 0.1,
         gamma_context: float = 1.0,
         tau: float = 0.5,
-        repetition_penalty: float = 1.3,
+        repetition_penalty: float = 2.5,
     ) -> None:
         # model: any HuggingFace CausalLM
         # tokenizer: corresponding tokenizer
@@ -104,9 +104,9 @@ class HFWaveCollapseDecoder:
     @torch.no_grad()
     def _iterative_collapse(
         self,
-               logits: torch.Tensor,
-               hidden_states: torch.Tensor,
-               generated_ids: set | None = None,
+        logits: torch.Tensor,
+        hidden_states: torch.Tensor,
+        generated_ids: dict[int, int] | None = None,
     ) -> int:
         # Same algorithm as WaveCollapseDecoder v3
         # K candidates, T iterations
@@ -119,7 +119,20 @@ class HFWaveCollapseDecoder:
             top_ids_list = top_idx.tolist()
             for i, tok_id in enumerate(top_ids_list):
                 if tok_id in generated_ids:
-                    top_logits[i] = top_logits[i] / self.repetition_penalty
+                    count = generated_ids[tok_id]
+                    penalty = self.repetition_penalty ** count
+                    if top_logits[i] > 0:
+                        top_logits[i] = top_logits[i] / penalty
+                    else:
+                        top_logits[i] = top_logits[i] * penalty
+
+            n_penalized = sum(1 for t in top_idx.tolist() if t in generated_ids)
+            total_generated = sum(generated_ids.values()) if generated_ids else 0
+            print(
+                f"DEBUG penalty: step={total_generated} generated={len(generated_ids)} unique tokens, "
+                f"penalized {n_penalized}/{len(top_idx)} candidates",
+                flush=True,
+            )
 
         emb = self.model.get_input_embeddings()
         candidate_states = emb(top_idx)  # (K, D)
@@ -149,7 +162,7 @@ class HFWaveCollapseDecoder:
         enc = self.tokenizer(prompt, return_tensors="pt")
         input_ids = enc["input_ids"].to(self.device)
 
-        generated_ids: set[int] = set()
+        generated_ids: dict[int, int] = {}
 
         # Autoregressive generation with wave collapse
         for _ in range(max_new_tokens):
@@ -162,7 +175,7 @@ class HFWaveCollapseDecoder:
 
             next_token = torch.tensor([[next_id]], device=self.device, dtype=input_ids.dtype)
             input_ids = torch.cat([input_ids, next_token], dim=1)
-            generated_ids.add(next_id)
+            generated_ids[next_id] = generated_ids.get(next_id, 0) + 1
 
         # Return decoded string
         return self.tokenizer.decode(input_ids[0], skip_special_tokens=True)
