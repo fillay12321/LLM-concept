@@ -134,8 +134,14 @@ class HFWaveCollapseDecoder:
                 flush=True,
             )
 
-        emb = self.model.get_input_embeddings()
-        candidate_states = emb(top_idx)  # (K, D)
+        # Use output projection weights — these contain real semantic
+        # representations in the model's output space
+        try:
+            lm_head = self.model.lm_head.weight
+        except AttributeError:
+            # fallback to input embeddings
+            lm_head = self.model.get_input_embeddings().weight
+        candidate_states = lm_head[top_idx].detach()  # (K, D)
         candidate_states = F.normalize(candidate_states.to(dtype=torch.float32), p=2, dim=-1, eps=1e-12)
 
         # Context vector from last few hidden states
@@ -163,6 +169,8 @@ class HFWaveCollapseDecoder:
         input_ids = enc["input_ids"].to(self.device)
 
         generated_ids: dict[int, int] = {}
+        generated_seq: list[int] = []
+        seen_trigrams: set[tuple[int, int, int]] = set()
 
         past_key_values = None
         current_input = input_ids
@@ -180,11 +188,21 @@ class HFWaveCollapseDecoder:
             past_key_values = outputs.past_key_values
 
             next_logits = logits[0, -1]  # (V,)
+            if len(generated_seq) >= 2:
+                a, b = generated_seq[-2], generated_seq[-1]
+                top_idx = torch.topk(next_logits, k=min(self.K, next_logits.numel()), dim=-1).indices
+                blocked = [int(t.item()) for t in top_idx if (a, b, int(t.item())) in seen_trigrams]
+                if blocked:
+                    next_logits = next_logits.clone()
+                    next_logits[torch.tensor(blocked, device=next_logits.device, dtype=torch.long)] = -float("inf")
             next_id = self._iterative_collapse(next_logits, hidden_states, generated_ids)
 
             next_token = torch.tensor([[next_id]], device=self.device, dtype=input_ids.dtype)
             input_ids = torch.cat([input_ids, next_token], dim=1)
             generated_ids[next_id] = generated_ids.get(next_id, 0) + 1
+            generated_seq.append(next_id)
+            if len(generated_seq) >= 3:
+                seen_trigrams.add(tuple(generated_seq[-3:]))
             current_input = next_token  # only feed new token each step
 
         # Return decoded string

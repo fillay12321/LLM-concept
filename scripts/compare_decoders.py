@@ -60,6 +60,7 @@ def _generate_greedy(model, tokenizer, prompt: str, max_new_tokens: int) -> Tupl
             max_new_tokens=max_new_tokens,
             do_sample=False,
             repetition_penalty=2.5,
+            no_repeat_ngram_size=3,
             pad_token_id=tokenizer.eos_token_id,
         )
     dt_ms = int((time.perf_counter() - t0) * 1000)
@@ -85,6 +86,7 @@ def _generate_topk(model, tokenizer, prompt: str, max_new_tokens: int, k: int = 
             top_k=k,
             top_p=1.0,
             repetition_penalty=2.5,
+            no_repeat_ngram_size=3,
             pad_token_id=tokenizer.eos_token_id,
         )
     dt_ms = int((time.perf_counter() - t0) * 1000)
