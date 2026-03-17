@@ -117,12 +117,6 @@ class MinkowskiAttention(nn.Module):
         average_attn_weights: bool = True,
         is_causal: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        if is_causal:
-            raise NotImplementedError(
-                "MinkowskiAttention does not currently implement is_causal. "
-                "Use an explicit attn_mask instead."
-            )
-
         q, k, v, transposed = _canonicalize_attn_inputs(query, key, value, self.batch_first)
         tgt_len, batch_size, _ = q.shape
         src_len = k.shape[0]
@@ -158,12 +152,21 @@ class MinkowskiAttention(nn.Module):
         s2 = (-alpha * dt2_b) + (beta * (dx * dx + dy * dy + dz * dz))  # (N, L, S)
         logits = s2.masked_fill(s2 > 0.0, float("-inf"))
 
+        if is_causal:
+            # Combine physical Minkowski masking with logical causal masking (j > i).
+            # Mask is created directly on the logits device.
+            causal_mask = torch.triu(
+                torch.ones((tgt_len, src_len), device=logits.device, dtype=torch.bool),
+                diagonal=1,
+            )  # (L, S)
+            logits.masked_fill_(causal_mask.unsqueeze(0), float("-inf"))
+
         if attn_mask is not None:
             if attn_mask.dtype == torch.bool:
                 if attn_mask.dim() == 2:
-                    logits = logits.masked_fill(attn_mask.unsqueeze(0), float("-inf"))
+                    logits.masked_fill_(attn_mask.unsqueeze(0), float("-inf"))
                 elif attn_mask.dim() == 3:
-                    logits = logits.masked_fill(attn_mask, float("-inf"))
+                    logits.masked_fill_(attn_mask, float("-inf"))
                 else:
                     raise ValueError("attn_mask must be 2D or 3D when boolean")
             else:

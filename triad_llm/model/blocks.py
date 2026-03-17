@@ -30,6 +30,7 @@ class MinkowskiTransformerBlock(nn.Module):
         self,
         x: torch.Tensor,
         key_padding_mask: Optional[torch.Tensor] = None,
+        is_causal: bool = True,
     ) -> torch.Tensor:
         h = self.ln1(x)
         attn_out, _ = self.attn(
@@ -38,6 +39,7 @@ class MinkowskiTransformerBlock(nn.Module):
             h,
             key_padding_mask=key_padding_mask,
             need_weights=False,
+            is_causal=is_causal,
         )
         x = x + self.drop1(attn_out)
 
@@ -71,15 +73,43 @@ class StandardTransformerBlock(nn.Module):
         self,
         x: torch.Tensor,
         key_padding_mask: Optional[torch.Tensor] = None,
+        is_causal: bool = True,
     ) -> torch.Tensor:
         h = self.ln1(x)
-        attn_out, _ = self.attn(
-            h,
-            h,
-            h,
-            key_padding_mask=key_padding_mask,
-            need_weights=False,
-        )
+        # Prefer built-in causal path when available; fall back to an explicit triangular mask
+        # for older PyTorch versions.
+        if is_causal:
+            try:
+                attn_out, _ = self.attn(
+                    h,
+                    h,
+                    h,
+                    key_padding_mask=key_padding_mask,
+                    need_weights=False,
+                    is_causal=True,
+                )
+            except TypeError:
+                l = h.shape[1]
+                causal_mask = torch.triu(
+                    torch.ones((l, l), device=h.device, dtype=torch.bool),
+                    diagonal=1,
+                )
+                attn_out, _ = self.attn(
+                    h,
+                    h,
+                    h,
+                    key_padding_mask=key_padding_mask,
+                    need_weights=False,
+                    attn_mask=causal_mask,
+                )
+        else:
+            attn_out, _ = self.attn(
+                h,
+                h,
+                h,
+                key_padding_mask=key_padding_mask,
+                need_weights=False,
+            )
         x = x + self.drop1(attn_out)
 
         h = self.ln2(x)
